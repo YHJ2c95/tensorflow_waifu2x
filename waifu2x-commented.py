@@ -33,16 +33,24 @@ model_list.append(json.load(open(denoisemodelpath)))
 #   * kW,kH : 未使用値(重み行列1つの大きさであると思われる。配布されているモデルの場合は全て3x3である)
 
 im = Image.open(infile).convert("YCbCr") # 入力ファイルの読み込み -> YCbCr色空間への変換
+# miku (228, 159)
 
 width = 2*im.size[0]
 height =  2*im.size[1]
 
 im = misc.fromimage(im.resize((width, height), resample=Image.NEAREST)).astype("float32")
+# (318, 456, 3)
+# height x width x c
+
 # 入力画像を2倍の幅・高さにNearestNeighbor法でリサイズした後、それをscipyで取り扱い可能な行列表現にし、
 # その要素の型を32bit-floatにする
 planes = [np.pad(im[:,:,0], len(model_list[0]) + len(model_list[1]), "edge") / 255.0]
 planes = np.array(planes)
+# (1, 346, 484) 7+7
+
 planes = planes.reshape(1, planes.shape[1], planes.shape[2], 1)
+# (1, 346, 484, 1)
+
 # 画像データの周りに、画像の端をコピーする形で、モデルの大きさ(核の行列の大きさ)分だけパッドを入れ、0~1の間でクリップする
 # このplanesは輝度情報のみを取り出している(!)
 # オリジナルのwaifu2xも、reconstruct時に入力をYUV色空間に変換した後、Yのみを取り出して処理している
@@ -50,31 +58,40 @@ planes = planes.reshape(1, planes.shape[1], planes.shape[2], 1)
 # count = sum(step["nInputPlane"] * step["nOutputPlane"] for step in model)# 畳み込み演算の必要回数を計算
 # つまり、countの数だけ入力平面に対する重み行列の畳み込みが行われる。
 planes = np.transpose(planes, (0, 3, 1, 2))
+# (1, 1, 346, 484)
 progress = 0
 x = None
 for model in model_list:
     for step in model: # ループ:ステップ(1つのモデル階層) 始め
         if x is None:
-             x = tf.constant(planes, shape=(1, step["nInputPlane"],planes.shape[2], planes.shape[3]), dtype=tf.float32)
+             #x = tf.constant(planes, shape=(1, step["nInputPlane"],planes.shape[2], planes.shape[3]), dtype=tf.float32)
+             # (1, 1, 346, 484) NCHW -> NHWC (1, 346, 484, 1)
+             x = tf.constant(planes, shape=(1,planes.shape[2], planes.shape[3], step["nInputPlane"]), dtype=tf.float32)
         # assert step["nInputPlane"] == planes.shape[1]
         # このステップのモデルに定義された入力平面の数と実際の入力平面の数は一致していなければならない
         # assert step["nOutputPlane"] == len(step["weight"]) == len(step["bias"])
         # モデルの出力平面はモデルの重み行列集合の数とそのバイアスの数と一致していなければならない
         # つまり、各ステップの重み行列集合の数とそのバイアスの数だけ、そのステップによって平面が出力される
         # o_planes = [] # 出力平面の格納場所を初期化
+        # 1->32 weight:32x1x3x3 (32, 1, 3, 3) bias:32
+        # need  x: 1xhxwx1 w: 3x3x32x1
        
         W = tf.constant(np.transpose(np.array(step["weight"]), (2, 3, 1, 0)), shape=(3, 3, step["nInputPlane"], step["nOutputPlane"]),dtype=tf.float32)
-        b = tf.constant(np.array(step["bias"]), shape=(1,step["nOutputPlane"], 1, 1), dtype=tf.float32)
-        x = tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding="VALID", data_format="NCHW")
+        #W = tf.constant(np.transpose(np.array(step["weight"]), (2, 3, 0, 1)), shape=(3, 3, step["nInputPlane"], step["nOutputPlane"]),dtype=tf.float32)
+        
+        b = tf.constant(np.array(step["bias"]), shape=(1, 1, 1,step["nOutputPlane"]), dtype=tf.float32)
+        #x = tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding="VALID", data_format="NCHW")
+        x = tf.nn.conv2d(x, W, strides=[1, 1, 1, 1], padding="VALID", data_format="NHWC")
+        
         x = x + b
         x = tf.maximum(x, 0.1 * x)
+#x = tf.transpose(x, [0,3,1,2], name='NHWC_to_NCHW')
 with tf.Session() as sess:
     planes = sess.run(x)
 
 # ループ:ステップ 終わり
-
 assert len(planes) == 1 # 最後のステップにおける出力平面は1つでなければならない
-im[:,:,0] = np.clip(planes.reshape(planes.shape[2], planes.shape[3]), 0, 1) * 255
+im[:,:,0] = np.clip(planes.reshape(planes.shape[1], planes.shape[2]), 0, 1) * 255
 # 得られた出力平面の全要素を0~1にクリップした後、
 misc.toimage(im, mode="YCbCr").convert("RGB").save(outfile)
 sys.stderr.write("Done\n")
